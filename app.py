@@ -4,8 +4,6 @@ import pandas as pd
 import re
 import base64
 from io import BytesIO
-import tempfile
-import os
 
 # Configuración de la página
 st.set_page_config(
@@ -14,123 +12,110 @@ st.set_page_config(
     layout="centered"
 )
 
-# Título y descripción de la app
 st.title("Conversor de Extracto Bancario Galicia")
-st.write("Esta aplicación convierte extractos bancarios del Banco Galicia en formato PDF a archivos Excel estructurados.")
+st.write("Esta aplicación convierte extractos bancarios del Banco Galicia (formato Office Banking) en PDF a archivos Excel estructurados.")
 
-def procesar_descripcion(descripcion_raw):
-    """
-    Procesa la descripción y la divide en descripción y detalle cuando es posible.
-    """
-    if ' POR ' in descripcion_raw:
-        partes = descripcion_raw.strip().split(' POR ', 1)
-        return partes[0].strip(), partes[1].strip()
-    elif ' DE ' in descripcion_raw:
-        partes = descripcion_raw.strip().split(' DE ', 1)
-        return partes[0].strip(), partes[1].strip()
-    else:
-        return descripcion_raw.strip(), ""
+# --- Patrones ---
+PATRON_FECHA = re.compile(r'^(\d{2}/\d{2}/\d{4})\s+(.*)$')
+PATRON_MONTO = re.compile(r'([+-])\s*\$\s*([\d\.]+,\d{2})')
+PATRON_SALDO = re.compile(r'\$\s*([\d\.]+,\d{2})\s*$')
 
-def limpiar_valor_numerico(valor):
-    """
-    Limpia y convierte valores numéricos del formato argentino al formato numérico de Python.
-    Mantiene el signo negativo.
-    """
-    if not valor:
+def limpiar_valor_numerico(valor_str):
+    """Convierte un número en formato argentino (1.234.567,89) a float."""
+    if not valor_str:
         return 0.0
-    
-    # Preservar el signo negativo
-    es_negativo = valor.startswith('-')
-    valor_sin_signo = valor.replace('-', '')
-    
-    # Reemplazar separadores
-    valor_limpio = valor_sin_signo.replace('.', '').replace(',', '.')
-    
-    # Convertir a float y aplicar signo si es necesario
+    valor_limpio = valor_str.strip().replace('.', '').replace(',', '.')
     try:
-        resultado = float(valor_limpio)
-        return -resultado if es_negativo else resultado
+        return float(valor_limpio)
     except ValueError:
-        st.warning(f"Error al convertir valor: {valor}")
         return 0.0
+
+def es_linea_ruido(linea):
+    """Detecta líneas que no son parte de un movimiento (encabezados, pie de página, numeración)."""
+    if linea in {"Office Banking", "Galicia"}:
+        return True
+    if linea.startswith("Fecha de descarga"):
+        return True
+    # timestamp tipo "02/09/26 - 10:11hs"
+    if re.match(r'^\d{2}/\d{2}/\d{2}\s*-\s*\d{2}:\d{2}hs$', linea):
+        return True
+    # numero de página suelto (1 o 2 dígitos solos)
+    if re.match(r'^\d{1,2}$', linea):
+        return True
+    # fila de encabezado de la tabla
+    if "Fecha" in linea and "Descripción" in linea and ("Débito" in linea or "Crédito" in linea) and "Saldo" in linea:
+        return True
+    return False
 
 def extraer_movimientos_del_pdf(pdf_file):
     """
-    Extrae los movimientos bancarios de un PDF del Banco Galicia.
-    Procesa todas las páginas del PDF.
+    Extrae los movimientos bancarios de un extracto Galicia - Office Banking.
+    Cada movimiento puede ocupar varias líneas: la primera trae
+    fecha + concepto + importe + saldo, y las siguientes traen datos
+    adicionales (nombre, CUIT, banco, categoría, etc.) que se agrupan en
+    la columna 'detalle'. El flag "dentro de la tabla" persiste entre
+    páginas, porque el encabezado de columnas solo aparece una vez.
     """
     movimientos = []
-    
+    inicio_movimientos = False
+
     with pdfplumber.open(pdf_file) as pdf:
         for pagina in pdf.pages:
-            texto = pagina.extract_text()
-            
-            # Procesamos el texto de cada página
+            texto = pagina.extract_text() or ""
             lineas = texto.split('\n')
-            inicio_movimientos = False
-            
-            for linea in lineas:
-                # Detectamos el inicio de la tabla de movimientos
-                if "Fecha" in linea and "Descripción" in linea and ("Crédito" in linea or "Débito" in linea) and "Saldo" in linea:
-                    inicio_movimientos = True
+
+            for linea_raw in lineas:
+                linea = linea_raw.strip()
+                if not linea:
                     continue
-                
-                # Si ya estamos en la sección de movimientos
-                if inicio_movimientos:
-                    # Intentamos con un patrón más flexible para diversos formatos
-                    patron_fecha = r"(\d{2}/\d{2}/\d{2})"
-                    
-                    # Si la línea comienza con una fecha, es un nuevo movimiento
-                    if re.match(patron_fecha, linea):
-                        # Intentamos usar diferentes patrones para capturar los formatos
-                        # Patrón más completo
-                        patron1 = r"(\d{2}/\d{2}/\d{2})\s+(.*?)(?:\s+(\w+))?\s+(?:(\d+[\.,]?\d*\.?\d*,\d+)?\s+)?(?:(-\d+[\.,]?\d*\.?\d*,\d+)?\s+)?(\d+[\.,]?\d*\.?\d*,\d+)$"
-                        # Patrón alternativo para casos específicos
-                        patron2 = r"(\d{2}/\d{2}/\d{2})\s+(.*?)\s+(\d+[\.,]?\d*\.?\d*,\d+|\-\d+[\.,]?\d*\.?\d*,\d+)\s+(\d+[\.,]?\d*\.?\d*,\d+)$"
-                        
-                        match = re.search(patron1, linea)
-                        
-                        if match:
-                            fecha, descripcion_raw, origen, credito, debito, saldo = match.groups()
-                            
-                            # Procesamos la descripción
-                            descripcion, detalle = procesar_descripcion(descripcion_raw)
-                            
-                            # Determinamos tipo de movimiento e importe
-                            if credito and credito.strip():
-                                importe = limpiar_valor_numerico(credito)
-                                tipo_movimiento = "Credito"
-                            elif debito and debito.strip():
-                                # Mantenemos el signo negativo en el importe para débitos
-                                importe = limpiar_valor_numerico(debito)  # Ya mantiene el signo negativo
-                                tipo_movimiento = "Debito"
-                            else:
-                                # Intentar un enfoque alternativo para casos especiales
-                                match_alt = re.search(patron2, linea)
-                                if match_alt:
-                                    fecha, descripcion_raw, importe_str, saldo = match_alt.groups()
-                                    descripcion, detalle = procesar_descripcion(descripcion_raw)
-                                    
-                                    # Procesamos el importe manteniendo el signo
-                                    importe = limpiar_valor_numerico(importe_str)
-                                    tipo_movimiento = "Debito" if importe < 0 else "Credito"
-                                else:
-                                    importe = 0.0
-                                    tipo_movimiento = "Desconocido"
-                            
-                            # Procesamos el saldo
-                            saldo_valor = limpiar_valor_numerico(saldo) if saldo else 0.0
-                            
-                            # Agregamos el movimiento a la lista
-                            movimientos.append({
-                                'fecha': fecha,
-                                'descripcion': descripcion,
-                                'detalle': detalle,
-                                'importe': importe if 'importe' in locals() else 0.0,
-                                'saldo': saldo_valor,
-                                'tipo_movimiento': tipo_movimiento if 'tipo_movimiento' in locals() else "Desconocido"
-                            })
-    
+
+                if not inicio_movimientos:
+                    if "Fecha" in linea and "Descripción" in linea and ("Débito" in linea or "Crédito" in linea) and "Saldo" in linea:
+                        inicio_movimientos = True
+                    continue
+
+                if es_linea_ruido(linea):
+                    continue
+
+                match_fecha = PATRON_FECHA.match(linea)
+
+                if match_fecha:
+                    # ---- Nueva fila de movimiento ----
+                    fecha = match_fecha.group(1)
+                    resto = match_fecha.group(2)
+
+                    montos = PATRON_MONTO.findall(resto)
+                    saldo_match = PATRON_SALDO.search(resto)
+                    saldo_valor = limpiar_valor_numerico(saldo_match.group(1)) if saldo_match else 0.0
+
+                    idx_dollar = resto.find('$')
+                    descripcion = resto[:idx_dollar].strip() if idx_dollar != -1 else resto.strip()
+
+                    if montos:
+                        signo, valor_str = montos[0]
+                        valor = limpiar_valor_numerico(valor_str)
+                        importe = valor if signo == '+' else -valor
+                        tipo_movimiento = "Credito" if signo == '+' else "Debito"
+                    else:
+                        importe = 0.0
+                        tipo_movimiento = "Desconocido"
+
+                    movimientos.append({
+                        'fecha': fecha,
+                        'descripcion': descripcion,
+                        'detalle_lineas': [],
+                        'importe': importe,
+                        'saldo': saldo_valor,
+                        'tipo_movimiento': tipo_movimiento
+                    })
+                else:
+                    # ---- Línea de detalle del movimiento anterior (incluye continuaciones entre páginas) ----
+                    if movimientos:
+                        movimientos[-1]['detalle_lineas'].append(linea)
+
+    for mov in movimientos:
+        mov['detalle'] = " | ".join(mov.pop('detalle_lineas'))
+
     return movimientos
 
 def get_table_download_link(df):
@@ -146,35 +131,21 @@ def get_table_download_link(df):
 uploaded_file = st.file_uploader("Carga tu extracto bancario en PDF", type=['pdf'])
 
 if uploaded_file is not None:
-    # Mostrar spinner mientras se procesa
     with st.spinner('Procesando el archivo PDF...'):
         try:
-            # Guardar el archivo cargado en un archivo temporal
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
-                temp_file.write(uploaded_file.getvalue())
-                temp_path = temp_file.name
-            
-            # Extraer los movimientos del PDF
-            movimientos = extraer_movimientos_del_pdf(temp_path)
-            
-            # Eliminar el archivo temporal
-            os.unlink(temp_path)
-            
+            movimientos = extraer_movimientos_del_pdf(uploaded_file)
+
             if movimientos:
-                # Crear un DataFrame
-                df = pd.DataFrame(movimientos)
-                
-                # Mostrar éxito
+                df = pd.DataFrame(movimientos, columns=['fecha', 'descripcion', 'detalle', 'importe', 'saldo', 'tipo_movimiento'])
+
                 st.success(f'¡Procesamiento completado! Se encontraron {len(movimientos)} movimientos.')
-                
-                # Mostrar los datos en una tabla
+
                 st.subheader("Vista previa de los datos extraídos:")
                 st.dataframe(df)
-                
-                # Proporcionar el enlace de descarga
+
                 st.markdown(get_table_download_link(df), unsafe_allow_html=True)
             else:
-                st.warning("No se encontraron movimientos en el PDF. Verifica que sea un extracto bancario del Banco Galicia.")
+                st.warning("No se encontraron movimientos en el PDF. Verifica que sea un extracto bancario del Banco Galicia en formato Office Banking.")
         except Exception as e:
             st.error(f"Error al procesar el archivo: {str(e)}")
 
@@ -182,11 +153,11 @@ if uploaded_file is not None:
 st.markdown("---")
 st.markdown("""
 ### Información
-- Esta aplicación está diseñada específicamente para procesar extractos bancarios del Banco Galicia.
-- El archivo resultante tendrá las siguientes columnas: fecha, descripción, detalle, importe, saldo y tipo de movimiento.
+- Esta aplicación procesa extractos bancarios del Banco Galicia en formato "Office Banking".
+- El archivo resultante tendrá las columnas: fecha, descripcion, detalle, importe, saldo y tipo_movimiento.
 - Los valores de débito mantienen su signo negativo para facilitar los cálculos.
+- Los datos adicionales de cada movimiento (nombre, CUIT, banco, categoría) se agrupan en la columna "detalle", separados por " | ".
 """)
 
-# Footer
 st.markdown("---")
 st.markdown("Desarrollado con Streamlit")
